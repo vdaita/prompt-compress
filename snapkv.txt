@@ -414,5 +414,3 @@ The findings indicate a slowdown in \texttt{Medusa}'s performance as sequence le
 % limitation
 Despite its strengths, \kv's scope is primarily confined to the generative aspect of models, specifically targeting the KV caches during the generation. This limitation implies that \kv cannot extend a model's long context capability if the model inherently struggles with long contexts or exhibits poor performance. Additionally, \kv's design does not cover the processing of the prompt inference, which limits its effectiveness in scenarios where the system cannot handle prompts of extensive length.
 Nonetheless, our contributions offer significant insights and tools for the community, paving the way for more refined approaches on managing the challenges of large-scale language modeling.
-
-What's the GitHub repository for SnapKV?
