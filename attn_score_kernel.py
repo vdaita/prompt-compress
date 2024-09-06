@@ -85,7 +85,7 @@ def get_top_k(q, k, hidden_dim, top_k, block_size):
     # TODO: Figure out causal masking and batching later
     q_pool = q.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     k_pool = k.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
-    p_pool = torch.einsum(f'mk, nk -> bhmn', q_pool, k_pool)
+    p_pool = torch.einsum(f'mk, nk -> mn', q_pool, k_pool)
     ret = torch.topk(p_pool, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
     print("Regular implementation shape: ", ret.shape)
     return ret
@@ -102,7 +102,7 @@ def get_top_k_two_layer(q, k, hidden_dim, top_k, block_size):
 
     output = torch.zeros((q_pool_len, 2 * top_k * secondary_block_size), device='cuda')
     grid = (triton.cdiv(q_pool_len, secondary_block_size), )
-    k_rnd = k_rnd.transpose(-1, -2)
+    k_pool = k_pool.transpose(-1, -2)
 
     block_sparse_attn_kernel[grid](
         q_pool, k_pool, blocks, output, 
@@ -118,44 +118,39 @@ def get_top_k_two_layer(q, k, hidden_dim, top_k, block_size):
         q_pool_len
     )
 
-
     ret = torch.topk(output, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
-    print("New implementation output shape: ", ret)
+    print("New implementation output shape: ", ret.shape)
     return ret
 
-if __name__ == "__main__":
-    q_len = 128
-    k_len = 128
-    h_dim = 64
-    base_top_k = 16
-    block_size = 16
-    
+def time_func_with_random(two_layers, regular, num_tokens=128000):
+    q_len = num_tokens
+    k_len = num_tokens
+    h_dim = 128
+    top_k = 50
+    block_size = 64
+
     q_rnd, k_rnd = torch.rand((q_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda')
-    blocks = torch.randint(low=0, high=(k_len // block_size), size=(q_len // block_size, base_top_k), device='cuda')
-    output = torch.zeros((q_len, base_top_k * block_size), device='cuda')
-    grid = (triton.cdiv(q_len, block_size), )
 
-    k_rnd = k_rnd.transpose(-1, -2)
-    print(f"Shapes- q_rnd: {q_rnd.shape}, k_rnd: {k_rnd.shape}, blocks: {blocks.shape}, output: {output.shape}, grid: {grid}")
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = two_layers(q_rnd, k_rnd, h_dim, top_k, block_size)
+    end.record()
+    torch.cuda.synchronize()
 
-    print("Blocks: ", blocks)
+    two_layer_time = start.elapsed_time(end) / 1000
 
-    block_sparse_attn_kernel[grid](q_rnd, k_rnd, blocks, output, 
-        q_rnd.stride(0), q_rnd.stride(1),
-        k_rnd.stride(0), k_rnd.stride(1),
-        blocks.stride(0), blocks.stride(1),
-        output.stride(0), output.stride(1),
-        q_len, k_len,
-        block_size, block_size,
-        h_dim,
-        math.ceil(k_len / block_size),
-        base_top_k,
-        q_len
-    ) # compare the top-k computation time 
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    result = regular(q_rnd, k_rnd, h_dim, top_k, block_size)
+    end.record()
+    torch.cuda.synchronize()
 
-    pytorch_output = pytorch_impl(q_rnd, k_rnd, blocks, block_size=block_size)
+    regular_time = start.elapsed_time(end) / 1000
 
-    print("Output from triton: ", output)
-    print("Output from pytorch: ", pytorch_output)
+    print(f"Two layer time: {two_layer_time}, Regular time: {regular_time}, Ratio: {two_layer_time/regular_time}")
 
-    print("Are tensors equivalent?: ", torch.allclose(output, pytorch_output, atol=1e-2, rtol=1e-2))
+if __name__ == "__main__":
+    for i in range(10):
+        time_func_with_random(get_top_k_two_layer, get_top_k)
