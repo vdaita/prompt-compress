@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import math
+from minference.ops.block_sparse_flash_attention import _triton_block_sparse_attention
 import pdb
 
 def pytorch_impl(q, k, blocks, block_size=16):
@@ -80,27 +81,39 @@ def block_sparse_attn_kernel(
         )
         tl.store(o_blocks_ptr, qk)
 
-@torch.compile
-def get_top_k(q, k, hidden_dim, top_k, block_size):
+@torch.compile(fullgraph=True) # Fullgraph=True to integrate with Triton
+def get_top_k(q, k, v, hidden_dim, top_k, block_size):
     # TODO: Figure out causal masking and batching later
     q_pool = q.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     k_pool = k.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     p_pool = torch.einsum(f'mk, nk -> mn', q_pool, k_pool)
-    ret = torch.topk(p_pool, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
-    print("Regular implementation shape: ", ret.shape)
-    return ret
-    
-@torch.compile
-def get_top_k_two_layer(q, k, hidden_dim, top_k, block_size):
+    block_indices = torch.topk(p_pool, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
+
+    if not(v == None):
+        seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
+        sm_scale = hidden_dim ** -0.5
+        q = q.unsqueeze(0).unsqueeze(0)
+        k = k.unsqueeze(0).unsqueeze(0)
+        v = v.unsqueeze(0).unsqueeze(0)
+        block_indices = block_indices.unsqueeze(0).unsqueeze(0)
+        return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
+    # print("Get_top_k shape: ", ret.shape)
+    return block_indices
+
+
+@torch.compile(fullgraph=True)
+def get_top_k_two_layer(q, k, v, hidden_dim, top_k, block_size, return_completed=False):
     secondary_block_size = 16
+    block_top_k_adj = top_k * 3
+
     q_pool = q.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     k_pool = k.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
-    blocks = get_top_k(q_pool, k_pool, hidden_dim, top_k * 2, secondary_block_size)
+    blocks = get_top_k(q_pool, k_pool, None, hidden_dim, block_top_k_adj, secondary_block_size)
 
     q_pool_len = q_pool.shape[-2]
     k_pool_len = k_pool.shape[-2]
 
-    output = torch.zeros((q_pool_len, 2 * top_k * secondary_block_size), device='cuda')
+    output = torch.zeros((q_pool_len, block_top_k_adj * secondary_block_size), device='cuda')
     grid = (triton.cdiv(q_pool_len, secondary_block_size), )
     k_pool = k_pool.transpose(-1, -2)
 
@@ -118,23 +131,31 @@ def get_top_k_two_layer(q, k, hidden_dim, top_k, block_size):
         q_pool_len
     )
 
-    ret = torch.topk(output, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
-    print("New implementation output shape: ", ret.shape)
-    return ret
+    block_indices = torch.topk(output, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
+    if not(v == None):
+        seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
+        sm_scale = hidden_dim ** -0.5
+        q = q.unsqueeze(0).unsqueeze(0)
+        k = k.unsqueeze(0).unsqueeze(0)
+        v = v.unsqueeze(0).unsqueeze(0)
+        block_indices = block_indices.unsqueeze(0).unsqueeze(0)
+        return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
+    # print("New implementation output shape: ", ret.shape)
+    return block_indices
 
-def time_func_with_random(two_layers, regular, num_tokens=128000):
+def time_func_with_random(num_tokens=512000):
     q_len = num_tokens
     k_len = num_tokens
-    h_dim = 128
-    top_k = 50
-    block_size = 64
+    h_dim = 64
+    top_k = 20
+    block_size = 16
 
-    q_rnd, k_rnd = torch.rand((q_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda')
+    q_rnd, k_rnd, v_rnd = torch.rand((q_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda')
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    result = two_layers(q_rnd, k_rnd, h_dim, top_k, block_size)
+    result = get_top_k_two_layer(q_rnd, k_rnd, None, h_dim, top_k, block_size)
     end.record()
     torch.cuda.synchronize()
 
@@ -143,7 +164,7 @@ def time_func_with_random(two_layers, regular, num_tokens=128000):
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    result = regular(q_rnd, k_rnd, h_dim, top_k, block_size)
+    result = get_top_k(q_rnd, k_rnd, None, h_dim, top_k, block_size)
     end.record()
     torch.cuda.synchronize()
 
@@ -153,4 +174,4 @@ def time_func_with_random(two_layers, regular, num_tokens=128000):
 
 if __name__ == "__main__":
     for i in range(10):
-        time_func_with_random(get_top_k_two_layer, get_top_k)
+        time_func_with_random()
