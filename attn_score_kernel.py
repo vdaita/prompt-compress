@@ -18,7 +18,7 @@ def pytorch_impl(q, k, blocks, block_size=16):
     return output
 
 @triton.jit
-def block_sparse_attn_kernel(
+def block_sparse_attn_score_kernel(
     q_ptr: tl.tensor, 
     k_ptr: tl.tensor,
     blocks_ptr: tl.tensor,
@@ -81,33 +81,37 @@ def block_sparse_attn_kernel(
         )
         tl.store(o_blocks_ptr, qk)
 
-@torch.compile(fullgraph=True) # Fullgraph=True to integrate with Triton
+# @torch.compile(fullgraph=True) # Fullgraph=True to integrate with Triton
 def get_top_k(q, k, v, hidden_dim, top_k, block_size):
     # TODO: Figure out causal masking and batching later
+    # batch_size, head_dim, _, _ = q.shape
+    # q_pool = q.reshape((batch_size, head_dim, -1, block_size, hidden_dim)).mean(dim=-2)
+    # k_pool = k.reshape((batch_size, head_dim, -1, block_size, hidden_dim)).mean(dim=-2)
     q_pool = q.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     k_pool = k.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
     p_pool = torch.einsum(f'mk, nk -> mn', q_pool, k_pool)
     block_indices = torch.topk(p_pool, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
-
-    if not(v == None):
-        seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
-        sm_scale = hidden_dim ** -0.5
-        q = q.unsqueeze(0).unsqueeze(0)
-        k = k.unsqueeze(0).unsqueeze(0)
-        v = v.unsqueeze(0).unsqueeze(0)
-        block_indices = block_indices.unsqueeze(0).unsqueeze(0)
-        return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
+    # if not(v == None):
+    #     seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
+    #     sm_scale = hidden_dim ** -0.5
+    #     q = q.unsqueeze(0).unsqueeze(0)
+    #     k = k.unsqueeze(0).unsqueeze(0)
+    #     v = v.unsqueeze(0).unsqueeze(0)
+    #     block_indices = block_indices.unsqueeze(0).unsqueeze(0)
+    #     return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
     # print("Get_top_k shape: ", ret.shape)
     return block_indices
 
 
-@torch.compile(fullgraph=True)
+# @torch.compile(fullgraph=True)
 def get_top_k_two_layer(q, k, v, hidden_dim, top_k, block_size, return_completed=False):
-    secondary_block_size = 16
-    block_top_k_adj = top_k * 3
+    batch_size, n_head, q_len, _ = q.shape
 
-    q_pool = q.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
-    k_pool = k.reshape((-1, block_size, hidden_dim)).mean(dim=-2)
+    secondary_block_size = 16
+    block_top_k_adj = top_k * 2
+
+    q_pool = q.reshape((batch_size, n_head, -1, block_size, hidden_dim)).mean(dim=-2)
+    k_pool = k.reshape((batch_size, n_head, -1, block_size, hidden_dim)).mean(dim=-2)
     blocks = get_top_k(q_pool, k_pool, None, hidden_dim, block_top_k_adj, secondary_block_size)
 
     q_pool_len = q_pool.shape[-2]
@@ -117,7 +121,7 @@ def get_top_k_two_layer(q, k, v, hidden_dim, top_k, block_size, return_completed
     grid = (triton.cdiv(q_pool_len, secondary_block_size), )
     k_pool = k_pool.transpose(-1, -2)
 
-    block_sparse_attn_kernel[grid](
+    block_sparse_attn_score_kernel[grid](
         q_pool, k_pool, blocks, output, 
         q_pool.stride(0), q_pool.stride(1),
         k_pool.stride(0), k_pool.stride(1),
@@ -132,22 +136,22 @@ def get_top_k_two_layer(q, k, v, hidden_dim, top_k, block_size, return_completed
     )
 
     block_indices = torch.topk(output, top_k, dim=-1).indices.to(torch.int32).sort(dim=-1).values
-    if not(v == None):
-        seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
-        sm_scale = hidden_dim ** -0.5
-        q = q.unsqueeze(0).unsqueeze(0)
-        k = k.unsqueeze(0).unsqueeze(0)
-        v = v.unsqueeze(0).unsqueeze(0)
-        block_indices = block_indices.unsqueeze(0).unsqueeze(0)
-        return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
+    # if not(v == None):
+    #     seqlens = torch.tensor([k.shape[-2]], dtype=torch.int32, device=q.device)
+    #     sm_scale = hidden_dim ** -0.5
+    #     q = q.unsqueeze(0).unsqueeze(0)
+    #     k = k.unsqueeze(0).unsqueeze(0)
+    #     v = v.unsqueeze(0).unsqueeze(0)
+    #     block_indices = block_indices.unsqueeze(0).unsqueeze(0)
+    #     return _triton_block_sparse_attention(q, k, v, seqlens, block_indices, sm_scale, block_size, block_size)
     # print("New implementation output shape: ", ret.shape)
     return block_indices
 
-def time_func_with_random(num_tokens=512000):
+def time_func_with_random(num_tokens=256000):
     q_len = num_tokens
     k_len = num_tokens
-    h_dim = 64
-    top_k = 20
+    h_dim = 128
+    top_k = 400
     block_size = 16
 
     q_rnd, k_rnd, v_rnd = torch.rand((q_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda'), torch.rand((k_len, h_dim), device='cuda')
